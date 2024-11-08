@@ -714,6 +714,8 @@ pub mod error {
     pub use crate::sdp::SdpError;
 }
 
+mod latency;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Errors for the whole Rtc engine.
@@ -1384,7 +1386,7 @@ impl Rtc {
             return Ok(Output::Timeout(not_happening()));
         }
 
-        while let Some(e) = self.ice.poll_event() {
+        while let Some(e) = latency::reveal!("ice.poll_event", self.ice.poll_event()) {
             match e {
                 IceAgentEvent::IceRestart(_) => {
                     //
@@ -1419,7 +1421,7 @@ impl Rtc {
 
         let mut dtls_connected = false;
 
-        while let Some(e) = self.dtls.poll_event() {
+        while let Some(e) = latency::reveal!("dtls.poll_event", self.dtls.poll_event()) {
             match e {
                 DtlsEvent::Connected => {
                     debug!("DTLS connected");
@@ -1431,7 +1433,10 @@ impl Rtc {
                         srtp_profile
                     );
                     let active = self.dtls.is_active().expect("DTLS must be inited by now");
-                    self.session.set_keying_material(mat, srtp_profile, active);
+                    latency::reveal!(
+                        "session.set_keying_material",
+                        self.session.set_keying_material(mat, srtp_profile, active)
+                    );
                 }
                 DtlsEvent::RemoteFingerprint(v1) => {
                     debug!("DTLS verify remote fingerprint");
@@ -1446,7 +1451,10 @@ impl Rtc {
                     }
                 }
                 DtlsEvent::Data(v) => {
-                    self.sctp.handle_input(self.last_now, &v);
+                    latency::reveal!(
+                        "DTLS: sctp.handle_input",
+                        self.sctp.handle_input(self.last_now, &v)
+                    );
                 }
             }
         }
@@ -1455,7 +1463,7 @@ impl Rtc {
             return Ok(Output::Event(Event::Connected));
         }
 
-        while let Some(e) = self.sctp.poll() {
+        while let Some(e) = latency::reveal!("sctp.poll", self.sctp.poll()) {
             match e {
                 SctpEvent::Transmit { mut packets } => {
                     if let Some(v) = packets.front() {
@@ -1500,16 +1508,22 @@ impl Rtc {
             }
         }
 
-        if let Some(ev) = self.session.poll_event() {
+        if let Some(ev) = latency::reveal!("session.poll_event", self.session.poll_event()) {
             return Ok(Output::Event(ev));
         }
 
         // Some polling needs to bubble up errors.
-        if let Some(ev) = self.session.poll_event_fallible()? {
+        if let Some(ev) = latency::reveal!(
+            "session.poll_event_fallible",
+            self.session.poll_event_fallible()
+        )? {
             return Ok(Output::Event(ev));
         }
 
-        if let Some(e) = self.stats.as_mut().and_then(|s| s.poll_output()) {
+        if let Some(e) = latency::reveal!(
+            "stats.poll_output",
+            self.stats.as_mut().and_then(|s| s.poll_output())
+        ) {
             return Ok(match e {
                 StatsEvent::Peer(s) => Output::Event(Event::PeerStats(s)),
                 StatsEvent::MediaIngress(s) => Output::Event(Event::MediaIngressStats(s)),
@@ -1517,7 +1531,7 @@ impl Rtc {
             });
         }
 
-        if let Some(v) = self.ice.poll_transmit() {
+        if let Some(v) = latency::reveal!("ice.poll_transmit", self.ice.poll_transmit()) {
             return Ok(Output::Transmit(v));
         }
 
@@ -1540,13 +1554,16 @@ impl Rtc {
 
         let stats = self.stats.as_mut();
 
-        let time_and_reason = (None, Reason::NotHappening)
-            .soonest((self.dtls.poll_timeout(self.last_now), Reason::DTLS))
-            .soonest((self.ice.poll_timeout(), Reason::Ice))
-            .soonest(self.session.poll_timeout())
-            .soonest((self.sctp.poll_timeout(), Reason::Sctp))
-            .soonest((self.chan.poll_timeout(&self.sctp), Reason::Channel))
-            .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats));
+        let time_and_reason = latency::reveal!(
+            "compute time and reason",
+            (None, Reason::NotHappening)
+                .soonest((self.dtls.poll_timeout(self.last_now), Reason::DTLS))
+                .soonest((self.ice.poll_timeout(), Reason::Ice))
+                .soonest(self.session.poll_timeout())
+                .soonest((self.sctp.poll_timeout(), Reason::Sctp))
+                .soonest((self.chan.poll_timeout(&self.sctp), Reason::Channel))
+                .soonest((stats.and_then(|s| s.poll_timeout()), Reason::Stats))
+        );
 
         // trace!("poll_output timeout reason: {}", time_and_reason.1);
 
@@ -1700,25 +1717,27 @@ impl Rtc {
     }
 
     fn do_handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
-        self.init_time(now);
+        latency::reveal!("do_handle_timeout", {
+            self.init_time(now);
 
-        self.last_now = now;
-        self.ice.handle_timeout(now);
-        self.sctp.handle_timeout(now);
-        self.chan.handle_timeout(now, &mut self.sctp);
-        self.session.handle_timeout(now)?;
+            self.last_now = now;
+            self.ice.handle_timeout(now);
+            self.sctp.handle_timeout(now);
+            self.chan.handle_timeout(now, &mut self.sctp);
+            self.session.handle_timeout(now)?;
 
-        if let Some(stats) = &mut self.stats {
-            if stats.wants_timeout(now) {
-                let mut snapshot = StatsSnapshot::new(now);
-                snapshot.peer_rx = self.peer_bytes_rx;
-                snapshot.peer_tx = self.peer_bytes_tx;
-                self.session.visit_stats(now, &mut snapshot);
-                stats.do_handle_timeout(&mut snapshot);
+            if let Some(stats) = &mut self.stats {
+                if stats.wants_timeout(now) {
+                    let mut snapshot = StatsSnapshot::new(now);
+                    snapshot.peer_rx = self.peer_bytes_rx;
+                    snapshot.peer_tx = self.peer_bytes_tx;
+                    self.session.visit_stats(now, &mut snapshot);
+                    stats.do_handle_timeout(&mut snapshot);
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn do_handle_receive(&mut self, now: Instant, r: net::Receive) -> Result<(), RtcError> {
@@ -1744,11 +1763,17 @@ impl Rtc {
                     destination: r.destination,
                     message: stun,
                 };
-                self.ice.handle_packet(now, packet);
+                latency::reveal!("ice.handle_packet", self.ice.handle_packet(now, packet));
             }
-            Dtls(dtls) => self.dtls.handle_receive(dtls)?,
-            Rtp(rtp) => self.session.handle_rtp_receive(now, rtp),
-            Rtcp(rtcp) => self.session.handle_rtcp_receive(now, rtcp),
+            Dtls(dtls) => latency::reveal!("dtls.handle_receive", self.dtls.handle_receive(dtls))?,
+            Rtp(rtp) => latency::reveal!(
+                "session.handle_rtp_receive",
+                self.session.handle_rtp_receive(now, rtp)
+            ),
+            Rtcp(rtcp) => latency::reveal!(
+                "session.handle_rtcp_receive",
+                self.session.handle_rtcp_receive(now, rtcp)
+            ),
         }
 
         Ok(())
