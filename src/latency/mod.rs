@@ -7,25 +7,41 @@ pub(super) mod revealer;
 
 macro_rules! reveal {
     ($func:literal, $expression:expr) => {{
-        let source_location = $crate::latency::revealer::SourceLocation {
-            func: $func,
-            module: module_path!(),
-            file: $crate::latency::revealer::FileLine(file!(), line!()),
-        };
         static STATS: std::sync::LazyLock<
             std::sync::Mutex<$crate::latency::revealer::CallSiteStats>,
         > = std::sync::LazyLock::new(|| {
-            std::sync::Mutex::new($crate::latency::revealer::CallSiteStats::new())
+            std::sync::Mutex::new($crate::latency::revealer::CallSiteStats::new(
+                $crate::latency::revealer::SourceLocation {
+                    func: $func,
+                    module: module_path!(),
+                    file: $crate::latency::revealer::FileLine(file!(), line!()),
+                },
+            ))
         });
-        let mut stats = STATS.lock().unwrap();
-        let start_time = std::time::Instant::now();
-        let result = $expression;
-        let latency: $crate::latency::Micros = start_time.elapsed().into();
-        stats.maybe_reveal(source_location, latency);
-        result
+        let mut usage = $crate::latency::revealer::CallSiteUsage::new(STATS.lock().unwrap());
+        usage.record_iteration();
+        $expression
     }};
 }
 pub(super) use reveal;
+
+macro_rules! instrument_scope {
+    ($func:literal) => {{
+        static STATS: std::sync::LazyLock<
+            std::sync::Mutex<$crate::latency::revealer::CallSiteStats>,
+        > = std::sync::LazyLock::new(|| {
+            std::sync::Mutex::new($crate::latency::revealer::CallSiteStats::new(
+                $crate::latency::revealer::SourceLocation {
+                    func: $func,
+                    module: module_path!(),
+                    file: $crate::latency::revealer::FileLine(file!(), line!()),
+                },
+            ))
+        });
+        $crate::latency::revealer::CallSiteUsage::new(STATS.lock().unwrap())
+    }};
+}
+pub(super) use instrument_scope;
 
 /// A number of microseconds.
 ///

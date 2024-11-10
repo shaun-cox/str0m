@@ -1386,75 +1386,85 @@ impl Rtc {
             return Ok(Output::Timeout(not_happening()));
         }
 
-        while let Some(e) = latency::reveal!("ice.poll_event", self.ice.poll_event()) {
-            match e {
-                IceAgentEvent::IceRestart(_) => {
-                    //
-                }
-                IceAgentEvent::IceConnectionStateChange(v) => {
-                    return Ok(Output::Event(Event::IceConnectionStateChange(v)))
-                }
-                IceAgentEvent::DiscoveredRecv { proto, source } => {
-                    info!("ICE remote address: {:?}/{:?}", source, proto);
-                    self.remote_addrs.push(source);
-                    while self.remote_addrs.len() > 20 {
-                        self.remote_addrs.remove(0);
+        {
+            let mut usage = latency::instrument_scope!("ice.poll_event");
+            while let Some(e) = self.ice.poll_event() {
+                usage.record_iteration();
+                match e {
+                    IceAgentEvent::IceRestart(_) => {
+                        //
                     }
-                }
-                IceAgentEvent::NominatedSend {
-                    proto,
-                    source,
-                    destination,
-                } => {
-                    info!(
-                        "ICE nominated send from: {:?} to: {:?} with protocol {:?}",
-                        source, destination, proto,
-                    );
-                    self.send_addr = Some(SendAddr {
+                    IceAgentEvent::IceConnectionStateChange(v) => {
+                        return Ok(Output::Event(Event::IceConnectionStateChange(v)))
+                    }
+                    IceAgentEvent::DiscoveredRecv { proto, source } => {
+                        info!("ICE remote address: {:?}/{:?}", source, proto);
+                        self.remote_addrs.push(source);
+                        while self.remote_addrs.len() > 20 {
+                            self.remote_addrs.remove(0);
+                        }
+                    }
+                    IceAgentEvent::NominatedSend {
                         proto,
                         source,
                         destination,
-                    });
+                    } => {
+                        info!(
+                            "ICE nominated send from: {:?} to: {:?} with protocol {:?}",
+                            source, destination, proto,
+                        );
+                        self.send_addr = Some(SendAddr {
+                            proto,
+                            source,
+                            destination,
+                        });
+                    }
                 }
             }
         }
 
         let mut dtls_connected = false;
 
-        while let Some(e) = latency::reveal!("dtls.poll_event", self.dtls.poll_event()) {
-            match e {
-                DtlsEvent::Connected => {
-                    debug!("DTLS connected");
-                    dtls_connected = true;
-                }
-                DtlsEvent::SrtpKeyingMaterial(mat, srtp_profile) => {
-                    info!(
-                        "DTLS set SRTP keying material and profile: {}",
-                        srtp_profile
-                    );
-                    let active = self.dtls.is_active().expect("DTLS must be inited by now");
-                    latency::reveal!(
-                        "session.set_keying_material",
-                        self.session.set_keying_material(mat, srtp_profile, active)
-                    );
-                }
-                DtlsEvent::RemoteFingerprint(v1) => {
-                    debug!("DTLS verify remote fingerprint");
-                    if let Some(v2) = &self.remote_fingerprint {
-                        if v1 != *v2 {
-                            self.disconnect();
-                            return Err(RtcError::RemoteSdp("remote fingerprint no match".into()));
-                        }
-                    } else {
-                        self.disconnect();
-                        return Err(RtcError::RemoteSdp("no a=fingerprint before dtls".into()));
+        {
+            let mut usage = latency::instrument_scope!("dtls.poll_event");
+            while let Some(e) = self.dtls.poll_event() {
+                usage.record_iteration();
+                match e {
+                    DtlsEvent::Connected => {
+                        debug!("DTLS connected");
+                        dtls_connected = true;
                     }
-                }
-                DtlsEvent::Data(v) => {
-                    latency::reveal!(
-                        "DTLS: sctp.handle_input",
-                        self.sctp.handle_input(self.last_now, &v)
-                    );
+                    DtlsEvent::SrtpKeyingMaterial(mat, srtp_profile) => {
+                        info!(
+                            "DTLS set SRTP keying material and profile: {}",
+                            srtp_profile
+                        );
+                        let active = self.dtls.is_active().expect("DTLS must be inited by now");
+                        latency::reveal!(
+                            "session.set_keying_material",
+                            self.session.set_keying_material(mat, srtp_profile, active)
+                        );
+                    }
+                    DtlsEvent::RemoteFingerprint(v1) => {
+                        debug!("DTLS verify remote fingerprint");
+                        if let Some(v2) = &self.remote_fingerprint {
+                            if v1 != *v2 {
+                                self.disconnect();
+                                return Err(RtcError::RemoteSdp(
+                                    "remote fingerprint no match".into(),
+                                ));
+                            }
+                        } else {
+                            self.disconnect();
+                            return Err(RtcError::RemoteSdp("no a=fingerprint before dtls".into()));
+                        }
+                    }
+                    DtlsEvent::Data(v) => {
+                        latency::reveal!(
+                            "DTLS: sctp.handle_input",
+                            self.sctp.handle_input(self.last_now, &v)
+                        );
+                    }
                 }
             }
         }
@@ -1463,60 +1473,61 @@ impl Rtc {
             return Ok(Output::Event(Event::Connected));
         }
 
-        while let Some(e) = latency::reveal!("sctp.poll", self.sctp.poll()) {
-            match e {
-                SctpEvent::Transmit { mut packets } => {
-                    if let Some(v) = packets.front() {
-                        if let Err(e) = self.dtls.handle_input(v) {
-                            if e.is_would_block() {
-                                self.sctp.push_back_transmit(packets);
-                                break;
-                            } else {
-                                return Err(e.into());
+        {
+            let mut usage = latency::instrument_scope!("sctp.poll");
+            while let Some(e) = self.sctp.poll() {
+                usage.record_iteration();
+                match e {
+                    SctpEvent::Transmit { mut packets } => {
+                        if let Some(v) = packets.front() {
+                            if let Err(e) = self.dtls.handle_input(v) {
+                                if e.is_would_block() {
+                                    self.sctp.push_back_transmit(packets);
+                                    break;
+                                } else {
+                                    return Err(e.into());
+                                }
                             }
+                            packets.pop_front();
+                            // If there are still packets, they are sent on next
+                            // poll_output()
+                            if !packets.is_empty() {
+                                self.sctp.push_back_transmit(packets);
+                            }
+                            break;
                         }
-                        packets.pop_front();
-                        // If there are still packets, they are sent on next
-                        // poll_output()
-                        if !packets.is_empty() {
-                            self.sctp.push_back_transmit(packets);
-                        }
-                        break;
                     }
-                }
-                SctpEvent::Open { id, label } => {
-                    self.chan.ensure_channel_id_for(id);
-                    let id = self.chan.channel_id_by_stream_id(id).unwrap();
-                    return Ok(Output::Event(Event::ChannelOpen(id, label)));
-                }
-                SctpEvent::Close { id } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop ChannelClose event for id: {:?}", id);
-                        continue;
-                    };
-                    self.chan.remove_channel(id);
-                    return Ok(Output::Event(Event::ChannelClose(id)));
-                }
-                SctpEvent::Data { id, binary, data } => {
-                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
-                        warn!("Drop ChannelData event for id: {:?}", id);
-                        continue;
-                    };
-                    let cd = ChannelData { id, binary, data };
-                    return Ok(Output::Event(Event::ChannelData(cd)));
+                    SctpEvent::Open { id, label } => {
+                        self.chan.ensure_channel_id_for(id);
+                        let id = self.chan.channel_id_by_stream_id(id).unwrap();
+                        return Ok(Output::Event(Event::ChannelOpen(id, label)));
+                    }
+                    SctpEvent::Close { id } => {
+                        let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                            warn!("Drop ChannelClose event for id: {:?}", id);
+                            continue;
+                        };
+                        self.chan.remove_channel(id);
+                        return Ok(Output::Event(Event::ChannelClose(id)));
+                    }
+                    SctpEvent::Data { id, binary, data } => {
+                        let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                            warn!("Drop ChannelData event for id: {:?}", id);
+                            continue;
+                        };
+                        let cd = ChannelData { id, binary, data };
+                        return Ok(Output::Event(Event::ChannelData(cd)));
+                    }
                 }
             }
         }
 
-        if let Some(ev) = latency::reveal!("session.poll_event", self.session.poll_event()) {
+        if let Some(ev) = self.session.poll_event() {
             return Ok(Output::Event(ev));
         }
 
         // Some polling needs to bubble up errors.
-        if let Some(ev) = latency::reveal!(
-            "session.poll_event_fallible",
-            self.session.poll_event_fallible()
-        )? {
+        if let Some(ev) = self.session.poll_event_fallible()? {
             return Ok(Output::Event(ev));
         }
 
@@ -1717,27 +1728,26 @@ impl Rtc {
     }
 
     fn do_handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
-        latency::reveal!("do_handle_timeout", {
-            self.init_time(now);
+        let _usage = latency::instrument_scope!("do_handle_timeout");
+        self.init_time(now);
 
-            self.last_now = now;
-            self.ice.handle_timeout(now);
-            self.sctp.handle_timeout(now);
-            self.chan.handle_timeout(now, &mut self.sctp);
-            self.session.handle_timeout(now)?;
+        self.last_now = now;
+        self.ice.handle_timeout(now);
+        self.sctp.handle_timeout(now);
+        self.chan.handle_timeout(now, &mut self.sctp);
+        self.session.handle_timeout(now)?;
 
-            if let Some(stats) = &mut self.stats {
-                if stats.wants_timeout(now) {
-                    let mut snapshot = StatsSnapshot::new(now);
-                    snapshot.peer_rx = self.peer_bytes_rx;
-                    snapshot.peer_tx = self.peer_bytes_tx;
-                    self.session.visit_stats(now, &mut snapshot);
-                    stats.do_handle_timeout(&mut snapshot);
-                }
+        if let Some(stats) = &mut self.stats {
+            if stats.wants_timeout(now) {
+                let mut snapshot = StatsSnapshot::new(now);
+                snapshot.peer_rx = self.peer_bytes_rx;
+                snapshot.peer_tx = self.peer_bytes_tx;
+                self.session.visit_stats(now, &mut snapshot);
+                stats.do_handle_timeout(&mut snapshot);
             }
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 
     fn do_handle_receive(&mut self, now: Instant, r: net::Receive) -> Result<(), RtcError> {
